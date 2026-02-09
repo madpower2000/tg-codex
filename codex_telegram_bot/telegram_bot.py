@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Message, Update
-from telegram.error import TelegramError
+from telegram.error import Conflict, TelegramError
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -76,6 +76,7 @@ class TelegramBridgeBot:
 
         self._thread_to_chat: dict[str, int] = {}
         self._active_turn_by_chat: dict[int, str] = {}
+        self._thread_by_active_turn_id: dict[str, str] = {}
         self._turns_by_key: dict[tuple[str, str], TurnLiveState] = {}
 
     def run(self) -> None:
@@ -91,9 +92,18 @@ class TelegramBridgeBot:
         app.add_handler(CommandHandler("reset", self._cmd_reset))
         app.add_handler(CallbackQueryHandler(self._approval_callback, pattern=r"^approval:"))
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self._on_text))
+        app.add_error_handler(self._on_error)
 
         self._application = app
         app.run_polling()
+
+    async def _on_error(self, _: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+        err = context.error
+        if isinstance(err, Conflict):
+            logger.error("Telegram polling conflict: another bot instance is running. Shutting down.")
+            context.application.stop_running()
+            return
+        logger.error("Unhandled Telegram error", exc_info=err)
 
     def _bot(self) -> Bot:
         app = self._application
@@ -156,6 +166,10 @@ class TelegramBridgeBot:
             for key, turn in list(self._turns_by_key.items()):
                 if not turn.dirty:
                     continue
+                if turn.chat_id <= 0:
+                    if turn.completed:
+                        self._turns_by_key.pop(key, None)
+                    continue
 
                 try:
                     rendered = self._compose_turn_message(turn)
@@ -182,10 +196,17 @@ class TelegramBridgeBot:
                         "Telegram edit failed",
                         extra={"chat_id": turn.chat_id, "thread_id": turn.thread_id, "turn_id": turn.turn_id},
                     )
+                    if turn.completed:
+                        self._turns_by_key.pop(key, None)
+                        self._thread_by_active_turn_id.pop(turn.turn_id, None)
+                        if self._active_turn_by_chat.get(turn.chat_id) == turn.turn_id:
+                            self._active_turn_by_chat.pop(turn.chat_id, None)
+                        await self._drain_queued_inputs(turn.chat_id)
                     continue
 
                 if turn.completed:
                     self._turns_by_key.pop(key, None)
+                    self._thread_by_active_turn_id.pop(turn.turn_id, None)
                     if self._active_turn_by_chat.get(turn.chat_id) == turn.turn_id:
                         self._active_turn_by_chat.pop(turn.chat_id, None)
                     await self._drain_queued_inputs(turn.chat_id)
@@ -237,7 +258,9 @@ class TelegramBridgeBot:
 
         await self._state_store.reset_chat(chat_id)
         await self._approval_manager.clear_pending(chat_id)
-        self._active_turn_by_chat.pop(chat_id, None)
+        active_turn_id = self._active_turn_by_chat.pop(chat_id, None)
+        if active_turn_id:
+            self._thread_by_active_turn_id.pop(active_turn_id, None)
         self._turns_by_key = {key: value for key, value in self._turns_by_key.items() if value.chat_id != chat_id}
         await message.reply_text("Thread mapping reset for this chat.")
 
@@ -342,21 +365,20 @@ class TelegramBridgeBot:
             raise RuntimeError(f"Invalid turn/start response: {response!r}")
         turn_id = str(turn_payload["id"])
         self._active_turn_by_chat[chat_id] = turn_id
+        self._thread_by_active_turn_id[turn_id] = thread_id
         await self._state_store.set_last_turn_id(chat_id, turn_id)
 
-        if reply_to_message is not None:
-            msg = await reply_to_message.reply_text("Working on it...")
-        else:
-            msg = await self._bot().send_message(chat_id=chat_id, text="Working on it...")
+        live = self._get_or_create_turn_state(thread_id=thread_id, turn_id=turn_id)
+        if live.chat_id != chat_id:
+            live.chat_id = chat_id
+        live.dirty = True
 
-        live = TurnLiveState(
-            chat_id=chat_id,
-            thread_id=thread_id,
-            turn_id=turn_id,
-            live_message_id=msg.message_id,
-            created_at=time.monotonic(),
-        )
-        self._turns_by_key[(thread_id, turn_id)] = live
+        if live.live_message_id is None:
+            if reply_to_message is not None:
+                msg = await reply_to_message.reply_text("Working on it...")
+            else:
+                msg = await self._bot().send_message(chat_id=chat_id, text="Working on it...")
+            live.live_message_id = msg.message_id
 
         logger.info(
             "Started turn",
@@ -408,10 +430,16 @@ class TelegramBridgeBot:
         raise RuntimeError(f"Failed to create thread: {last_error!r}")
 
     async def _handle_notification(self, method: str, params: dict[str, Any]) -> None:
+        if method.startswith("codex/event/"):
+            await self._handle_codex_event_notification(params)
+            return
+
         if method == "item/agentMessage/delta":
-            turn = self._resolve_turn(params)
-            if turn is None:
+            thread_id = str(params.get("threadId", ""))
+            turn_id = str(params.get("turnId", ""))
+            if not thread_id or not turn_id:
                 return
+            turn = self._get_or_create_turn_state(thread_id=thread_id, turn_id=turn_id)
             delta = str(params.get("delta", ""))
             if delta:
                 turn.output_text += delta
@@ -419,21 +447,28 @@ class TelegramBridgeBot:
             return
 
         if method in {"item/started", "item/completed"}:
-            turn = self._resolve_turn(params)
-            if turn is None:
+            thread_id = str(params.get("threadId", ""))
+            turn_id = str(params.get("turnId", ""))
+            if not thread_id or not turn_id:
                 return
+            turn = self._get_or_create_turn_state(thread_id=thread_id, turn_id=turn_id)
             raw_item = params.get("item")
             item: dict[str, Any] = raw_item if isinstance(raw_item, dict) else {}
             item_type = str(item.get("type", "item"))
             phase = "started" if method.endswith("started") else "completed"
             turn.progress = f"{item_type} {phase}"
+            if method == "item/completed":
+                maybe_agent_text = self._extract_agent_text_from_item(item)
+                self._merge_agent_text(turn, maybe_agent_text)
             turn.dirty = True
             return
 
         if method in {"item/commandExecution/outputDelta", "item/fileChange/outputDelta"}:
-            turn = self._resolve_turn(params)
-            if turn is None:
+            thread_id = str(params.get("threadId", ""))
+            turn_id = str(params.get("turnId", ""))
+            if not thread_id or not turn_id:
                 return
+            turn = self._get_or_create_turn_state(thread_id=thread_id, turn_id=turn_id)
             if method.startswith("item/commandExecution"):
                 turn.progress = "command output streaming"
             else:
@@ -448,8 +483,13 @@ class TelegramBridgeBot:
             turn_id = str(turn_payload.get("id", ""))
             if not turn_id:
                 return
+            resolved_thread_id = self._resolve_thread_id_for_turn(thread_id=thread_id, turn_id=turn_id)
+            if not resolved_thread_id:
+                return
+            self._thread_by_active_turn_id[turn_id] = resolved_thread_id
+            self._get_or_create_turn_state(thread_id=resolved_thread_id, turn_id=turn_id)
 
-            chat_id = self._thread_to_chat.get(thread_id)
+            chat_id = self._thread_to_chat.get(resolved_thread_id)
             if chat_id is not None:
                 await self._state_store.set_last_turn_id(chat_id, turn_id)
             return
@@ -462,9 +502,12 @@ class TelegramBridgeBot:
             if not turn_id:
                 return
 
-            turn = self._turns_by_key.get((thread_id, turn_id))
-            if turn is None:
+            resolved_thread_id = self._resolve_thread_id_for_turn(thread_id=thread_id, turn_id=turn_id)
+            if not resolved_thread_id:
+                logger.warning("turn/completed missing thread id and no active mapping", extra={"turn_id": turn_id})
                 return
+
+            turn = self._get_or_create_turn_state(thread_id=resolved_thread_id, turn_id=turn_id)
 
             turn.status = str(turn_payload.get("status", "completed"))
             error_payload = turn_payload.get("error")
@@ -478,8 +521,149 @@ class TelegramBridgeBot:
 
             logger.info(
                 "Turn completed",
-                extra={"chat_id": turn.chat_id, "thread_id": thread_id, "turn_id": turn_id},
+                extra={"chat_id": turn.chat_id, "thread_id": turn.thread_id, "turn_id": turn_id},
             )
+
+    async def _handle_codex_event_notification(self, params: dict[str, Any]) -> None:
+        raw_msg = params.get("msg")
+        msg: dict[str, Any] = raw_msg if isinstance(raw_msg, dict) else {}
+        event_type = str(msg.get("type", ""))
+
+        thread_id, turn_id = self._resolve_event_ids(params, msg)
+        if not thread_id or not turn_id:
+            return
+
+        turn = self._get_or_create_turn_state(thread_id=thread_id, turn_id=turn_id)
+
+        if event_type == "agent_message_delta":
+            delta = msg.get("delta")
+            if isinstance(delta, str) and delta:
+                turn.output_text += delta
+                turn.dirty = True
+            return
+
+        if event_type == "agent_message":
+            message = msg.get("message")
+            if isinstance(message, str) and message:
+                self._merge_agent_text(turn, message.strip())
+                turn.progress = "agent message completed"
+                turn.dirty = True
+            return
+
+        if event_type in {"item_started", "item_completed"}:
+            raw_item = msg.get("item")
+            item: dict[str, Any] = raw_item if isinstance(raw_item, dict) else {}
+            item_type = str(item.get("type", "item")).lower()
+            phase = "started" if event_type == "item_started" else "completed"
+            turn.progress = f"{item_type} {phase}"
+            if event_type == "item_completed":
+                maybe_agent_text = self._extract_agent_text_from_item(item)
+                self._merge_agent_text(turn, maybe_agent_text)
+            turn.dirty = True
+            return
+
+        if event_type in {"task_complete", "task_completed"}:
+            turn.status = str(msg.get("status", "completed"))
+            raw_error = msg.get("error")
+            if isinstance(raw_error, str) and raw_error:
+                turn.error_message = raw_error
+            elif isinstance(raw_error, dict):
+                detail = raw_error.get("message")
+                if isinstance(detail, str) and detail:
+                    turn.error_message = detail
+            turn.completed = True
+            turn.dirty = True
+            return
+
+    def _get_or_create_turn_state(self, thread_id: str, turn_id: str) -> TurnLiveState:
+        key = (thread_id, turn_id)
+        existing = self._turns_by_key.get(key)
+        if existing is not None:
+            return existing
+
+        chat_id = self._thread_to_chat.get(thread_id)
+        if chat_id is None:
+            chat_id = 0
+
+        created = TurnLiveState(
+            chat_id=chat_id,
+            thread_id=thread_id,
+            turn_id=turn_id,
+            live_message_id=None,
+            created_at=time.monotonic(),
+        )
+        self._turns_by_key[key] = created
+        return created
+
+    def _resolve_thread_id_for_turn(self, thread_id: str, turn_id: str) -> str:
+        if thread_id:
+            return thread_id
+
+        mapped = self._thread_by_active_turn_id.get(turn_id)
+        if mapped:
+            return mapped
+
+        candidates = [existing_thread_id for existing_thread_id, existing_turn_id in self._turns_by_key if existing_turn_id == turn_id]
+        if len(candidates) == 1:
+            return candidates[0]
+        return ""
+
+    @staticmethod
+    def _resolve_event_ids(params: dict[str, Any], msg: dict[str, Any]) -> tuple[str, str]:
+        thread_id = ""
+        turn_id = ""
+
+        msg_thread_id = msg.get("thread_id")
+        msg_turn_id = msg.get("turn_id")
+        if isinstance(msg_thread_id, str) and msg_thread_id:
+            thread_id = msg_thread_id
+        if isinstance(msg_turn_id, str) and msg_turn_id:
+            turn_id = msg_turn_id
+
+        if not thread_id:
+            conversation_id = params.get("conversationId")
+            if isinstance(conversation_id, str):
+                thread_id = conversation_id
+        if not turn_id:
+            event_id = params.get("id")
+            if isinstance(event_id, str):
+                turn_id = event_id
+            elif isinstance(event_id, int):
+                turn_id = str(event_id)
+
+        return thread_id, turn_id
+
+    @staticmethod
+    def _extract_agent_text_from_item(item: dict[str, Any]) -> str:
+        item_type = str(item.get("type", "")).lower()
+        if item_type not in {"agentmessage", "agent_message"}:
+            return ""
+
+        chunks: list[str] = []
+        direct_text = item.get("text")
+        if isinstance(direct_text, str) and direct_text:
+            chunks.append(direct_text)
+
+        content = item.get("content")
+        if isinstance(content, list):
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                text = part.get("text")
+                if isinstance(text, str) and text:
+                    chunks.append(text)
+
+        return "".join(chunks).strip()
+
+    @staticmethod
+    def _merge_agent_text(turn: TurnLiveState, text: str) -> None:
+        if not text:
+            return
+        if not turn.output_text:
+            turn.output_text = text
+            return
+        if text.startswith(turn.output_text):
+            turn.output_text = text
 
     async def _handle_server_request(
         self,
@@ -490,16 +674,32 @@ class TelegramBridgeBot:
         if request_id is None:
             return
 
-        if method not in APPROVAL_METHODS:
-            logger.warning("Ignoring unsupported server request", extra={"method": method})
-            return
-
         thread_id = str(params.get("threadId", ""))
         chat_id = self._thread_to_chat.get(thread_id)
         if chat_id is None:
             chat_id = await self._state_store.chat_id_by_thread_id(thread_id)
             if chat_id is not None:
                 self._thread_to_chat[thread_id] = chat_id
+
+        if method == "item/tool/requestUserInput":
+            await self._codex.send_server_request_response(request_id, {"answers": []})
+            logger.warning(
+                "Auto-answered tool user-input request with empty answers",
+                extra={"thread_id": thread_id, "request_id": request_id, "method": method},
+            )
+            return
+
+        if method not in APPROVAL_METHODS:
+            await self._codex.send_server_request_error(
+                request_id=request_id,
+                code=-32601,
+                message=f"Unsupported server request method: {method}",
+            )
+            logger.warning(
+                "Rejected unsupported server request",
+                extra={"thread_id": thread_id, "request_id": request_id, "method": method},
+            )
+            return
 
         if chat_id is None:
             await self._codex.send_server_request_response(request_id, {"decision": "decline"})

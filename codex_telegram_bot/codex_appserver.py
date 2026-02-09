@@ -137,8 +137,19 @@ class CodexAppServerClient:
         await self._write_message({"method": method, "params": params})
 
     async def send_server_request_response(self, request_id: RequestId, result: dict[str, Any]) -> None:
-        await self._ready_event.wait()
         await self._write_message({"id": request_id, "result": result})
+
+    async def send_server_request_error(
+        self,
+        request_id: RequestId,
+        code: int,
+        message: str,
+        data: Any | None = None,
+    ) -> None:
+        error: dict[str, Any] = {"code": code, "message": message}
+        if data is not None:
+            error["data"] = data
+        await self._write_message({"id": request_id, "error": error})
 
     async def _send_request_with_id(
         self,
