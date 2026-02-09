@@ -13,8 +13,8 @@ Small local bridge that connects Telegram chats to a local `codex app-server` se
 ## Requirements
 
 - Python 3.12 (pinned via `.python-version`)
-- `uv` package manager
-- `codex` CLI installed and authenticated
+- [`uv` package manager](https://docs.astral.sh/uv/getting-started/installation/)
+- [`codex` CLI installed and authenticated](https://github.com/openai/codex)
 - Telegram bot token
 
 ## Setup

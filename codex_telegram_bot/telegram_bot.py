@@ -6,7 +6,7 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Message, Update
 from telegram.error import TelegramError
 from telegram.ext import (
     Application,
@@ -17,7 +17,7 @@ from telegram.ext import (
     filters,
 )
 
-from .approvals import ApprovalManager
+from .approvals import ApprovalDecision, ApprovalManager
 from .codex_appserver import CodexAppServerClient, RequestId, RpcResponseError
 from .config import Config, PRIMARY_MODEL_DEFAULT
 from .rate_limit import RateLimiter
@@ -95,7 +95,14 @@ class TelegramBridgeBot:
         self._application = app
         app.run_polling()
 
+    def _bot(self) -> Bot:
+        app = self._application
+        if app is None:
+            raise RuntimeError("Telegram application is not initialized")
+        return app.bot
+
     async def _post_init(self, _: Application) -> None:
+        await self._state_store.load()
         await self._rebuild_thread_index()
         await self._approval_manager.restore_from_state()
 
@@ -156,15 +163,16 @@ class TelegramBridgeBot:
                         turn.dirty = False
                         continue
 
+                    bot = self._bot()
                     if turn.live_message_id is not None:
                         await self._edit_limiter.wait_turn()
-                        await self._application.bot.edit_message_text(
+                        await bot.edit_message_text(
                             chat_id=turn.chat_id,
                             message_id=turn.live_message_id,
                             text=rendered,
                         )
                     else:
-                        sent = await self._application.bot.send_message(chat_id=turn.chat_id, text=rendered)
+                        sent = await bot.send_message(chat_id=turn.chat_id, text=rendered)
                         turn.live_message_id = sent.message_id
 
                     turn.last_rendered = rendered
@@ -185,6 +193,9 @@ class TelegramBridgeBot:
     async def _cmd_start(self, update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._authorize_update(update):
             return
+        message = update.effective_message
+        if message is None:
+            return
 
         text = (
             "Telegram to Codex bridge.\n"
@@ -193,25 +204,33 @@ class TelegramBridgeBot:
             "/reset - forget this chat's thread mapping\n"
             "Any non-command message starts a new turn in the mapped thread."
         )
-        await update.effective_message.reply_text(text)
+        await message.reply_text(text)
 
     async def _cmd_new(self, update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._authorize_update(update):
             return
+        message = update.effective_message
+        chat = update.effective_chat
+        if message is None or chat is None:
+            return
 
-        chat_id = update.effective_chat.id
+        chat_id = chat.id
         try:
             thread_id = await self._create_new_thread(chat_id)
-            await update.effective_message.reply_text(f"New Codex thread created: {thread_id}")
+            await message.reply_text(f"New Codex thread created: {thread_id}")
         except Exception:
             logger.exception("Failed to create new thread", extra={"chat_id": chat_id})
-            await update.effective_message.reply_text("Failed to create new thread.")
+            await message.reply_text("Failed to create new thread.")
 
     async def _cmd_reset(self, update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._authorize_update(update):
             return
+        message = update.effective_message
+        chat = update.effective_chat
+        if message is None or chat is None:
+            return
 
-        chat_id = update.effective_chat.id
+        chat_id = chat.id
         state = await self._state_store.get_chat_state(chat_id)
         if state.thread_id:
             self._thread_to_chat.pop(state.thread_id, None)
@@ -220,7 +239,7 @@ class TelegramBridgeBot:
         await self._approval_manager.clear_pending(chat_id)
         self._active_turn_by_chat.pop(chat_id, None)
         self._turns_by_key = {key: value for key, value in self._turns_by_key.items() if value.chat_id != chat_id}
-        await update.effective_message.reply_text("Thread mapping reset for this chat.")
+        await message.reply_text("Thread mapping reset for this chat.")
 
     async def _on_text(self, update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._authorize_update(update):
@@ -265,8 +284,12 @@ class TelegramBridgeBot:
             await query.answer("Invalid approval payload", show_alert=True)
             return
 
-        _, chat_id_raw, request_id_raw, decision = parts
-        if decision not in {"accept", "decline"}:
+        _, chat_id_raw, request_id_raw, decision_raw = parts
+        if decision_raw == "accept":
+            decision: ApprovalDecision = "accept"
+        elif decision_raw == "decline":
+            decision = "decline"
+        else:
             await query.answer("Invalid decision", show_alert=True)
             return
 
@@ -276,7 +299,8 @@ class TelegramBridgeBot:
             await query.answer("Invalid chat id", show_alert=True)
             return
 
-        if query.message is not None and query.message.chat_id != chat_id:
+        chat = update.effective_chat
+        if chat is None or chat.id != chat_id:
             await query.answer("Approval does not belong to this chat", show_alert=True)
             return
 
@@ -296,11 +320,12 @@ class TelegramBridgeBot:
             return
         await query.answer(f"Decision sent: {decision}")
 
-        original = query.message.text if query.message and query.message.text else "Approval"
+        message_text = getattr(query.message, "text", None)
+        original = message_text if isinstance(message_text, str) and message_text else "Approval"
         await query.edit_message_text(f"{original}\n\nDecision: {decision}")
         await self._drain_queued_inputs(chat_id)
 
-    async def _start_turn(self, chat_id: int, text: str, reply_to_message: Any | None = None) -> None:
+    async def _start_turn(self, chat_id: int, text: str, reply_to_message: Message | None = None) -> None:
         thread_id = await self._ensure_thread(chat_id)
 
         response = await self._codex.send_request(
@@ -322,7 +347,7 @@ class TelegramBridgeBot:
         if reply_to_message is not None:
             msg = await reply_to_message.reply_text("Working on it...")
         else:
-            msg = await self._application.bot.send_message(chat_id=chat_id, text="Working on it...")
+            msg = await self._bot().send_message(chat_id=chat_id, text="Working on it...")
 
         live = TurnLiveState(
             chat_id=chat_id,
@@ -397,7 +422,8 @@ class TelegramBridgeBot:
             turn = self._resolve_turn(params)
             if turn is None:
                 return
-            item = params.get("item") if isinstance(params.get("item"), dict) else {}
+            raw_item = params.get("item")
+            item: dict[str, Any] = raw_item if isinstance(raw_item, dict) else {}
             item_type = str(item.get("type", "item"))
             phase = "started" if method.endswith("started") else "completed"
             turn.progress = f"{item_type} {phase}"
@@ -417,8 +443,9 @@ class TelegramBridgeBot:
 
         if method == "turn/started":
             thread_id = str(params.get("threadId", ""))
-            turn = params.get("turn") if isinstance(params.get("turn"), dict) else {}
-            turn_id = str(turn.get("id", ""))
+            raw_turn = params.get("turn")
+            turn_payload: dict[str, Any] = raw_turn if isinstance(raw_turn, dict) else {}
+            turn_id = str(turn_payload.get("id", ""))
             if not turn_id:
                 return
 
@@ -429,7 +456,8 @@ class TelegramBridgeBot:
 
         if method == "turn/completed":
             thread_id = str(params.get("threadId", ""))
-            turn_payload = params.get("turn") if isinstance(params.get("turn"), dict) else {}
+            raw_turn = params.get("turn")
+            turn_payload: dict[str, Any] = raw_turn if isinstance(raw_turn, dict) else {}
             turn_id = str(turn_payload.get("id", ""))
             if not turn_id:
                 return
@@ -482,7 +510,7 @@ class TelegramBridgeBot:
             return
 
         pending = await self._approval_manager.register_approval(chat_id, request_id, method, params)
-        await self._application.bot.send_message(
+        await self._bot().send_message(
             chat_id=chat_id,
             text=self._format_approval_text(method, params),
             reply_markup=InlineKeyboardMarkup(

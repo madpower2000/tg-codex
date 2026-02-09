@@ -199,11 +199,12 @@ class CodexAppServerClient:
 
         self._reader_task = asyncio.create_task(self._reader_loop(), name="codex-appserver-reader")
 
+        client_info = InitializeClientInfo()
         init_params = {
             "clientInfo": {
-                "name": InitializeClientInfo.name,
-                "title": InitializeClientInfo.title,
-                "version": InitializeClientInfo.version,
+                "name": client_info.name,
+                "title": client_info.title,
+                "version": client_info.version,
             }
         }
         await self._send_request_with_id(0, "initialize", init_params, timeout_seconds=15.0)
@@ -282,14 +283,18 @@ class CodexAppServerClient:
             try:
                 result = handler(method, params)
                 if inspect.isawaitable(result):
-                    task = asyncio.create_task(result)
-                    task.add_done_callback(self._log_task_error)
+                    future = asyncio.ensure_future(result)
+                    future.add_done_callback(self._log_task_error)
             except Exception:
                 logger.exception("Notification handler failed", extra={"method": method})
 
     def _dispatch_server_request(self, message: dict[str, Any]) -> None:
         method = str(message.get("method", ""))
-        request_id = message.get("id")
+        request_id_raw = message.get("id")
+        if not isinstance(request_id_raw, (int, str)):
+            logger.error("Server request has invalid id type", extra={"method": method})
+            return
+        request_id: RequestId = request_id_raw
         params = message.get("params", {})
         if not isinstance(params, dict):
             params = {}
@@ -305,8 +310,8 @@ class CodexAppServerClient:
         try:
             result = handler(request_id, method, params)
             if inspect.isawaitable(result):
-                task = asyncio.create_task(result)
-                task.add_done_callback(self._log_task_error)
+                future = asyncio.ensure_future(result)
+                future.add_done_callback(self._log_task_error)
         except Exception:
             logger.exception(
                 "Server request handler failed",
@@ -362,9 +367,9 @@ class CodexAppServerClient:
                 process.wait(timeout=5)
 
     @staticmethod
-    def _log_task_error(task: asyncio.Task[Any]) -> None:
-        if task.cancelled():
+    def _log_task_error(future: asyncio.Future[Any]) -> None:
+        if future.cancelled():
             return
-        exc = task.exception()
+        exc = future.exception()
         if exc is not None:
             logger.exception("Background task failed", exc_info=exc)

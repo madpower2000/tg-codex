@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import logging
 
 from .approvals import ApprovalManager
@@ -16,7 +15,6 @@ def main() -> None:
     setup_logging(config.log_level)
 
     state_store = StateStore(config.state_path)
-    asyncio.run(state_store.load())
 
     codex_client = CodexAppServerClient(
         cwd=config.codex_cwd,
