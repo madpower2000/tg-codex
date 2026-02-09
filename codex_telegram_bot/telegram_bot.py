@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import logging
+import re
 import time
 from dataclasses import dataclass
 from typing import Any
 
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Message, Update
+from telegram.constants import ParseMode
 from telegram.error import Conflict, TelegramError
 from telegram.ext import (
     Application,
@@ -29,6 +32,11 @@ APPROVAL_METHODS = {
     "item/commandExecution/requestApproval",
     "item/fileChange/requestApproval",
 }
+
+_DUPLICATE_WORD_RE = re.compile(r"\b([\w']+)(\s+\1\b)+", flags=re.IGNORECASE)
+_DUPLICATE_PUNCT_RE = re.compile(r"([,.;:!?])\1+")
+_BOLD_RE = re.compile(r"\*\*([^*]+)\*\*")
+_CODE_RE = re.compile(r"`([^`]+)`")
 
 
 @dataclass(slots=True)
@@ -53,6 +61,7 @@ class TurnLiveState:
     dirty: bool = True
     last_rendered: str = ""
     completed: bool = False
+    saw_canonical_agent_delta: bool = False
 
 
 class TelegramBridgeBot:
@@ -184,9 +193,16 @@ class TelegramBridgeBot:
                             chat_id=turn.chat_id,
                             message_id=turn.live_message_id,
                             text=rendered,
+                            parse_mode=ParseMode.HTML,
+                            disable_web_page_preview=True,
                         )
                     else:
-                        sent = await bot.send_message(chat_id=turn.chat_id, text=rendered)
+                        sent = await bot.send_message(
+                            chat_id=turn.chat_id,
+                            text=rendered,
+                            parse_mode=ParseMode.HTML,
+                            disable_web_page_preview=True,
+                        )
                         turn.live_message_id = sent.message_id
 
                     turn.last_rendered = rendered
@@ -440,6 +456,7 @@ class TelegramBridgeBot:
             if not thread_id or not turn_id:
                 return
             turn = self._get_or_create_turn_state(thread_id=thread_id, turn_id=turn_id)
+            turn.saw_canonical_agent_delta = True
             delta = str(params.get("delta", ""))
             if delta:
                 turn.output_text += delta
@@ -536,6 +553,8 @@ class TelegramBridgeBot:
         turn = self._get_or_create_turn_state(thread_id=thread_id, turn_id=turn_id)
 
         if event_type == "agent_message_delta":
+            if turn.saw_canonical_agent_delta:
+                return
             delta = msg.get("delta")
             if isinstance(delta, str) and delta:
                 turn.output_text += delta
@@ -545,7 +564,7 @@ class TelegramBridgeBot:
         if event_type == "agent_message":
             message = msg.get("message")
             if isinstance(message, str) and message:
-                self._merge_agent_text(turn, message.strip())
+                turn.output_text = message.strip()
                 turn.progress = "agent message completed"
                 turn.dirty = True
             return
@@ -689,6 +708,18 @@ class TelegramBridgeBot:
             )
             return
 
+        if method in APPROVAL_METHODS and self._should_auto_approve(method):
+            await self._codex.send_server_request_response(request_id, {"decision": "accept"})
+            logger.warning(
+                "Auto-approved request via config",
+                extra={"thread_id": thread_id, "request_id": request_id, "method": method},
+            )
+            turn = self._resolve_turn(params)
+            if turn is not None:
+                turn.progress = "approval auto-accepted"
+                turn.dirty = True
+            return
+
         if method not in APPROVAL_METHODS:
             await self._codex.send_server_request_error(
                 request_id=request_id,
@@ -733,6 +764,13 @@ class TelegramBridgeBot:
         if turn is not None:
             turn.progress = "Awaiting approval"
             turn.dirty = True
+
+    def _should_auto_approve(self, method: str) -> bool:
+        if method == "item/commandExecution/requestApproval":
+            return self._config.auto_approve_commands
+        if method == "item/fileChange/requestApproval":
+            return self._config.auto_approve_file_changes
+        return False
 
     def _format_approval_text(self, method: str, params: dict[str, Any]) -> str:
         thread_id = str(params.get("threadId", ""))
@@ -789,28 +827,57 @@ class TelegramBridgeBot:
     def _compose_turn_message(self, turn: TurnLiveState) -> str:
         status = turn.status
         if turn.completed:
-            header = f"Status: {status}"
+            status_text = status
         else:
-            header = "Status: running"
+            status_text = "running"
 
-        lines = [header]
+        lines = [f"<b>Status:</b> {html.escape(status_text)}"]
         if turn.progress:
-            lines.append(f"Progress: {turn.progress}")
+            lines.append(f"<b>Progress:</b> {html.escape(turn.progress)}")
 
-        body = turn.output_text.strip()
+        body = self._normalize_output_text(turn.output_text)
         if not body:
-            body = "(no agent message yet)"
+            body_html = "(no agent message yet)"
+        else:
+            body_html = self._format_body_html(body)
 
-        if len(body) > 3600:
-            body = "...[truncated]\n" + body[-3600:]
         lines.append("")
-        lines.append(body)
+        lines.append(body_html)
 
         if turn.error_message:
             lines.append("")
-            lines.append(f"Error: {turn.error_message}")
+            lines.append(f"<b>Error:</b> {html.escape(turn.error_message)}")
 
         return "\n".join(lines)
+
+    @staticmethod
+    def _normalize_output_text(text: str) -> str:
+        cleaned = text.strip()
+        if not cleaned:
+            return ""
+
+        cleaned = _DUPLICATE_WORD_RE.sub(r"\1", cleaned)
+        cleaned = _DUPLICATE_PUNCT_RE.sub(r"\1", cleaned)
+        if len(cleaned) > 3400:
+            cleaned = "...[truncated]\n" + cleaned[-3400:]
+        return cleaned
+
+    def _format_body_html(self, text: str) -> str:
+        lines: list[str] = []
+        for line in text.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("- "):
+                lines.append(f"• {self._format_inline_html(stripped[2:].strip())}")
+            else:
+                lines.append(self._format_inline_html(line))
+        return "\n".join(lines)
+
+    @staticmethod
+    def _format_inline_html(text: str) -> str:
+        escaped = html.escape(text)
+        escaped = _BOLD_RE.sub(r"<b>\1</b>", escaped)
+        escaped = _CODE_RE.sub(r"<code>\1</code>", escaped)
+        return escaped
 
     async def _authorize_update(self, update: Update) -> bool:
         user = update.effective_user

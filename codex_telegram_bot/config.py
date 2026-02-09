@@ -17,6 +17,8 @@ class Config:
     codex_cwd: Path
     state_path: Path
     log_level: str
+    auto_approve_commands: bool
+    auto_approve_file_changes: bool
     live_edit_interval_seconds: float = 0.8
 
     @classmethod
@@ -30,6 +32,8 @@ class Config:
         cwd = Path(os.getenv("CODEX_CWD", ".")).resolve()
         state_path = Path(os.getenv("STATE_PATH", "./.codex_telegram_state.json")).resolve()
         log_level = os.getenv("LOG_LEVEL", "INFO").upper().strip() or "INFO"
+        auto_approve_commands = parse_bool_env("CODEX_AUTO_APPROVE_COMMANDS", default=False)
+        auto_approve_file_changes = parse_bool_env("CODEX_AUTO_APPROVE_FILE_CHANGES", default=False)
 
         return cls(
             telegram_bot_token=token,
@@ -39,6 +43,8 @@ class Config:
             codex_cwd=cwd,
             state_path=state_path,
             log_level=log_level,
+            auto_approve_commands=auto_approve_commands,
+            auto_approve_file_changes=auto_approve_file_changes,
         )
 
 
@@ -53,3 +59,15 @@ def parse_allowed_users(raw: str) -> set[int]:
         except ValueError as exc:
             raise ValueError(f"Invalid TELEGRAM_ALLOWED_USERS entry: {value!r}") from exc
     return users
+
+
+def parse_bool_env(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    value = raw.strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"Invalid boolean value for {name}: {raw!r}")

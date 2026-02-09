@@ -32,6 +32,8 @@ CODEX_MODEL=gpt-5.3-codex
 CODEX_CWD=C:/Projects/tg-codex
 STATE_PATH=./.codex_telegram_state.json
 LOG_LEVEL=INFO
+CODEX_AUTO_APPROVE_COMMANDS=false
+CODEX_AUTO_APPROVE_FILE_CHANGES=false
 ```
 
 Environment variable reference:
@@ -44,6 +46,11 @@ Environment variable reference:
   - `CODEX_CWD` - defaults to current working directory.
   - `STATE_PATH` - defaults to `./.codex_telegram_state.json`.
   - `LOG_LEVEL` - defaults to `INFO`.
+  - `CODEX_AUTO_APPROVE_COMMANDS` - when `true`, auto-accepts command execution approvals.
+  - `CODEX_AUTO_APPROVE_FILE_CHANGES` - when `true`, auto-accepts file-change approvals.
+
+Security note:
+- Auto-approve flags remove the Telegram human-approval gate. Enable only in trusted local environments.
 
 Run:
 
