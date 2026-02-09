@@ -3,7 +3,7 @@
 ## Project Structure & Module Organization
 - Main package: `codex_telegram_bot/`
 - Tests: `codex_telegram_bot/tests/`
-- Runtime docs/deps: `README.md`, `requirements.txt`
+- Runtime docs/deps: `README.md`, `pyproject.toml`
 
 ## Build, Test, and Development Commands
 - Sync environment: `uv sync`
